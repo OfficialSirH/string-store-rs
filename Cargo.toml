@@ -1,6 +1,23 @@
 [package]
-name = "string-store-rust"
-version = "0.1.0"
 edition = "2024"
+name = "string-store"
+version = "0.0.0"
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
+anyhow = "1.0.98"
+# Default enable napi4 feature, see https://nodejs.org/api/n-api.html#node-api-version-matrix
+napi = { version = "2.16.17", default-features = false, features = [
+  "napi4",
+  "anyhow",
+] }
+napi-derive = "2.16.13"
+
+[build-dependencies]
+napi-build = "2.2.1"
+
+[profile.release]
+lto = true
+strip = "symbols"
