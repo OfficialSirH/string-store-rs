@@ -1,350 +1,20 @@
-/// 20 subtracting one bit to ensure the character is within the valid range
-const CHAR_BIT_SPACE: usize = 19;
-const BITS_IN_BYTE: usize = 8;
-const BITS_IN_CONTINUATION_BYTES: usize = 6;
-const CHAR_SIZE: usize = 4;
+mod char_byte_segment;
+mod constants;
+mod data_requirement;
+mod deserializer;
+mod serializer;
 
-/// Assuming the max length bytes, 4, UTF-8 will allow:
-///     - at minimum, **1** bit at the 5th low bit on the second byte (`0b1111 0000 1001 0000 1000 0000 1000 0000`)
-///     - at maximum, **17** bits at the 3rd low bit on the first byte, the 4 low bits on the second byte, and all
-/// the leftover bits on the 3rd and 4th bytes (`0b1111 0100 1000 1111 1011 1111 1011 1111`)
-///     - at (flippable bits) maximum, **21** bits at the 2 low bits on the first byte and the rest of the bits on
-/// the leftover 3 bytes (`0b1111 0011 1011 1111 1011 1111 1011 1111`)
-///
-/// **Important Note:** at least *one* of the first 4 bits need to be flipped or the character will be invalid.<br>
-/// Current solution(s):
-///     - flip the first available bit by default so the character will always be valid but reducing max available
-///  bits from 20 -> 19.
-///
-/// <br>
-///
-/// # [Valid Encodings](https://stackoverflow.com/questions/66715611/check-for-valid-utf-8-encoding-in-c)
-///
-/// ## 1-byte (U+0000 - U+007F)
-/// Valid ASCII encoding (0x00 - 0x7F)
-///
-/// ## 2-bytes (U+0080 - U+07FF)
-/// Correct encodings for U+0080 is 0xC280, for U+07FF is 0xDFBF and all the in-between codepoints.
-///
-/// ## 3-bytes (U+0800 - U+FFFF)
-/// Correct encodings for U+0800 is 0xE0A080, for U+FFFF is 0xEFBFBF and all the in-between codepoints.
-///
-/// ## 4-bytes (U+010000 - U+10FFFF)
-/// Correct encodings for U+010000 is 0xF0908080, for U+10FFFF is 0xF48FBFBF and all the in-between codepoints.
-/// - Min 4-bytes value: `0b1111 0000 1001 0000 1000 0000 1000 0000`
-/// - Max 4-bytes value: `0b1111 0100 1000 1111 1011 1111 1011 1111`
-///
-/// <br>
-///
-/// # [Invalid Encodings](https://stackoverflow.com/questions/66715611/check-for-valid-utf-8-encoding-in-c)
-///
-/// ## Non ASCII single byte value (0x80 - 0xFF)
-/// - Possible stray continuation byte (0x80 - 0xBF)
-/// - Invalid start byte (0xC0-0xC1, 0xF5-0xFF) ->
-///     - Minimum start byte for 2 bytes: `0b11000010`
-///     - Maximum start byte for 4 bytes: `0b11110100`
-/// - Valid starting byte (0xC2-0xF4) not followed by a continuation byte
-///
-/// ## Missing continuation bytes
-/// One or more continuation bytes are missing
-///
-/// ## Invalid "continuation" byte
-/// If a byte is outside the valid range (0x80 - 0xBF)
-///
-/// <br>
-///
-/// # TypeScript Example:
-/// ```ts
-/// // Total size in bits: 69 (nice)
-/// // Total size in bits(with id): 77
-/// interface GameStats {
-///     // u4 size
-///     level: number;
-///     // u8 size
-///     x: number;
-///     // u8 size
-///     y: number;
-///     // u16 size
-///     coins: number;
-///     // 1 bit size
-///     hard: boolean;
-///     // u32 size
-///     kills: number;
-/// }
-/// ```
-pub fn serialize_u8_slice_to_utf8(
-    schema_data: Vec<u8>,
-    schema_bit_counts: Vec<usize>,
-) -> Result<String, &'static str> {
-    if schema_data.is_empty() {
-        return Err("Received empty schema data");
-    }
-
-    // let needed_bits = schema_bit_counts.iter().sum::<usize>();
-    let mut needed_bits = 0;
-    let mut needed_bits_iter = schema_bit_counts.iter();
-    while let Some(count) = needed_bits_iter.next() {
-        // Handle nullable schema cases
-        if *count == 0 {
-            needed_bits_iter.next();
-            needed_bits += 1;
-            continue;
-        }
-        needed_bits += count;
-    }
-    drop(needed_bits_iter);
-    println!("needed_bits: {needed_bits}");
-
-    if needed_bits == 0 {
-        return Err("Received 0 sized schema");
-    }
-    if schema_bit_counts
-        .iter()
-        .any(|bit_count| ![0, 1, 2, 4, 8].contains(bit_count))
-    {
-        return Err("Received unsupported bit count from schema");
-    }
-
-    let needed_chars = needed_bits / CHAR_BIT_SPACE + ((needed_bits % CHAR_BIT_SPACE) > 0) as usize;
-    println!("needed_chars: {needed_chars}");
-
-    let mut buffer: Vec<u8> = Vec::new();
-    buffer.resize_with(needed_chars * CHAR_SIZE, Default::default);
-
-    let mut bit_queue: Vec<u8> = Vec::new();
-    bit_queue.resize_with(needed_bits, Default::default);
-    let mut bit_queue_index: usize = 0;
-
-    let mut schema_bit_counts_iter = schema_bit_counts.iter();
-    for data_segment in schema_data {
-        let bit_count = *schema_bit_counts_iter.next().unwrap();
-        // Nullable values
-        // NOTE: Nullable values at the moment can only work on 1 byte data types
-        // possible solution: have the schema send the quantity of bytes after the
-        // null bit to determine the amount of following elements need to be included.
-        println!("data_segment: {data_segment}");
-        println!("bit_count: {bit_count}");
-        if bit_count == 0 {
-            if data_segment == 0 {
-                println!("hit");
-                let nullable_bytes = schema_bit_counts_iter.next().unwrap();
-                println!("nullable_bytes: {nullable_bytes}");
-                for _ in 0..*nullable_bytes {
-                    schema_bit_counts_iter.next();
-                }
-            } else {
-                schema_bit_counts_iter.next();
-                bit_queue[bit_queue_index] = 1;
-                bit_queue_index += 1;
-            }
-            continue;
-        }
-        for offset in (0..bit_count).rev() {
-            bit_queue[bit_queue_index] = (data_segment
-                .checked_shr(offset.try_into().unwrap())
-                .unwrap_or(0))
-                & 1;
-            bit_queue_index += 1;
-        }
-    }
-
-    let mut bit_queue_iter = bit_queue.iter();
-    for char_index in 0..needed_chars {
-        let buffer_index = CHAR_SIZE * char_index;
-        let mut character: [u8; CHAR_SIZE] = [
-            // always have the first_byte default with 2nd low bit flipped for utf-8 range validity
-            0b1111_0010,
-            0b1000_0000,
-            0b1000_0000,
-            0b1000_0000,
-        ];
-
-        // This unwrap is fine as the calculated required characters ensures that if we're at a new
-        // character, there will definitely be at least one bit left in the queue.
-        character[0] |= bit_queue_iter.next().unwrap();
-        buffer[buffer_index] = character[0];
-
-        // fill in the available 18 bits over the 3 continuation bytes of the character
-        for continuation_byte_index in 1..=3 {
-            for offset in (0..BITS_IN_CONTINUATION_BYTES).rev() {
-                if let Some(bit) = bit_queue_iter.next() {
-                    character[continuation_byte_index] |= bit << offset;
-                } else {
-                    break;
-                }
-            }
-            buffer[buffer_index + continuation_byte_index] = character[continuation_byte_index];
-        }
-    }
-
-    String::from_utf8(buffer).map_err(
-        |_| "Invalid utf-8 buffer (If you see this error, this is a bug and should be reported)",
-    )
-}
-
-enum CharByteSegment {
-    Start,
-    FirstContinuation,
-    SecondContinuation,
-    ThirdContinuation,
-}
-
-// Parses `schema_size` amount of bytes from the `buffer`
-pub fn deserialize_u8_slice_from_utf8(
-    buffer: String,
-    schema_bit_counts: Vec<usize>,
-) -> Result<Vec<u8>, &'static str> {
-    // let expected_bits = schema_bit_counts.iter().sum::<usize>();
-    let mut expected_bits = 0;
-    let mut expected_bits_iter = schema_bit_counts.iter();
-    while let Some(count) = expected_bits_iter.next() {
-        // Handle nullable schema cases
-        if *count == 0 {
-            expected_bits_iter.next();
-            expected_bits += 1;
-            continue;
-        }
-        expected_bits += count;
-    }
-    drop(expected_bits_iter);
-
-    if expected_bits == 0 {
-        return Err("Received 0 sized schema");
-    }
-    if schema_bit_counts
-        .iter()
-        .any(|bit_count| ![0, 1, 2, 4, 8].contains(bit_count))
-    {
-        return Err("Received unsupported bit count from schema");
-    }
-    println!("expected_bits: {expected_bits}");
-    // Example: one byte should only require 1 char
-    let expected_chars =
-        expected_bits / CHAR_BIT_SPACE + ((expected_bits % CHAR_BIT_SPACE) > 0) as usize;
-    println!("expected_chars: {expected_chars}");
-    if buffer.len() != expected_chars * CHAR_SIZE {
-        return Err("Buffer doesn't match the expected bytes for the schema");
-    }
-
-    // let schema_data_size = schema_bit_counts
-    //     .iter()
-    //     .cloned()
-    //     .reduce(|acc, e| acc + (e >= BITS_IN_BYTE).then(|| e / BITS_IN_BYTE).unwrap_or(1))
-    //     .unwrap();
-    //
-    // let mut schema_expanded_bit_counts: Vec<usize> = Vec::new();
-    // for bit_count in &schema_bit_counts {
-    //     if *bit_count > BITS_IN_BYTE {
-    //         for _ in 0..(bit_count / BITS_IN_BYTE) {
-    //             schema_expanded_bit_counts.push(BITS_IN_BYTE);
-    //         }
-    //         continue;
-    //     }
-    //     schema_expanded_bit_counts.push(*bit_count);
-    // }
-    let required_bytes = schema_bit_counts
-        .iter()
-        .cloned()
-        .fold(0, |acc, count| acc + (count != 0) as usize);
-    let mut schema_data: Vec<u8> = Vec::new();
-    schema_data.resize_with(required_bytes, Default::default);
-    println!("SCHEMA DATA SIZE: {}", schema_data.len());
-    println!("SCHEMA BIT COUNT: {}", schema_bit_counts.len());
-    let mut schema_data_iter = schema_data.iter_mut();
-    let mut data_segment = schema_data_iter.next().unwrap();
-    let mut schema_bit_counts = schema_bit_counts.iter();
-    let mut segment_bit_count = schema_bit_counts.next().unwrap();
-    let mut shift_offset = segment_bit_count.saturating_sub(1);
-    let mut expected_char_segment = CharByteSegment::Start;
-    for char_byte in buffer.as_bytes() {
-        let expected_byte_pattern: u8 = match expected_char_segment {
-            CharByteSegment::Start => 0b1111_0010,
-            _ => 0b1000_0000,
-        };
-
-        if char_byte & expected_byte_pattern != expected_byte_pattern {
-            return Err("Buffer has invalid data");
-        }
-
-        let mut extract_n_iterate = |bit_count: u8| {
-            println!("segment_bit_count: {segment_bit_count}");
-            println!("shift_offset: {shift_offset}");
-            for bit_index in (0..bit_count).rev() {
-                *data_segment |= ((char_byte >> bit_index) & 1) << shift_offset;
-                // println!("data_segment: {data_segment}");
-                if shift_offset == 0 {
-                    println!("hit");
-                    // Nullable values
-                    // NOTE: Nullable values at the moment can only work on 1 byte data types
-                    // possible solution: have the schema send the quantity of bytes after the
-                    // null bit to determine the amount of following elements need to be included.
-                    if *segment_bit_count == 0 {
-                        if *data_segment == 0 {
-                            println!("the sacred NULL");
-                            let nullable_bytes = schema_bit_counts.next().unwrap();
-                            for _ in 0..*nullable_bytes {
-                                schema_bit_counts.next();
-                                schema_data_iter.next();
-                            }
-                        } else {
-                            // schema_bit_counts.next();
-                            println!(
-                                "THE BYTE COUNT INDICATOR: {}",
-                                schema_bit_counts.next().unwrap()
-                            );
-                        }
-                    }
-                    match schema_data_iter.next() {
-                        Some(next_segment) => data_segment = next_segment,
-                        None => return false,
-                    };
-                    println!("new data_segment: {data_segment}");
-                    segment_bit_count = schema_bit_counts.next().unwrap();
-                    println!("new segment_bit_count: {segment_bit_count}");
-                    shift_offset = segment_bit_count.saturating_sub(1);
-                    println!("shift_offset: {shift_offset}");
-                    continue;
-                }
-                shift_offset -= 1;
-            }
-            true
-        };
-        expected_char_segment = match expected_char_segment {
-            CharByteSegment::Start => {
-                if !extract_n_iterate(1) {
-                    break;
-                }
-                CharByteSegment::FirstContinuation
-            }
-            CharByteSegment::FirstContinuation => {
-                if !extract_n_iterate(6) {
-                    break;
-                };
-                CharByteSegment::SecondContinuation
-            }
-            CharByteSegment::SecondContinuation => {
-                if !extract_n_iterate(6) {
-                    break;
-                };
-                CharByteSegment::ThirdContinuation
-            }
-            CharByteSegment::ThirdContinuation => {
-                if !extract_n_iterate(6) {
-                    break;
-                };
-                CharByteSegment::Start
-            }
-        };
-    }
-    println!("schema_data: {schema_data:?}");
-    Ok(schema_data)
-}
+pub use char_byte_segment::CharByteSegment;
+pub use constants::{BITS_IN_CONTINUATION_BYTES, CHAR_BIT_SPACE, CHAR_SIZE};
+pub use data_requirement::get_data_requirement;
+pub use deserializer::Deserializer;
+pub use serializer::Serializer;
 
 #[cfg(test)]
 mod tests {
     use std::mem::transmute;
 
-    use super::*;
+    use crate::{deserializer::Deserializer, serializer::Serializer};
 
     #[test]
     fn serialization() {
@@ -354,7 +24,8 @@ mod tests {
             String::from_utf8(vec![0b11110010, 0b10111111, 0b10100000, 0b10000000]).unwrap();
 
         println!("bytes: {:?}", expected_string);
-        let result = serialize_u8_slice_to_utf8(value.to_be_bytes().to_vec(), vec![8]).unwrap();
+        let serializer = Serializer::new(vec![8]);
+        let result = serializer.serialize(value.to_be_bytes().to_vec()).unwrap();
         assert_eq!(result, expected_string);
     }
 
@@ -364,7 +35,8 @@ mod tests {
         let four_byte_char =
             String::from_utf8(vec![0b11110010, 0b10111111, 0b10100000, 0b10000000]).unwrap();
 
-        let result = deserialize_u8_slice_from_utf8(four_byte_char, vec![8]);
+        let deserializer = Deserializer::new(vec![8]);
+        let result = deserializer.deserialize(four_byte_char.as_bytes().to_vec());
         if let Err(message) = result {
             println!("{message}");
         }
@@ -383,7 +55,7 @@ mod tests {
             })
             .concat();
 
-        let schema_bit_counts = vec![8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
+        let schema = vec![8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
 
         println!(
             "values: {:?}",
@@ -393,8 +65,8 @@ mod tests {
                 .collect::<Vec<String>>()
                 .join(" ")
         );
-        let serialized_data =
-            serialize_u8_slice_to_utf8(values, schema_bit_counts.clone()).unwrap();
+        let serializer = Serializer::new(schema.clone());
+        let serialized_data = serializer.serialize(values).unwrap();
         println!(
             "serialized_data: {:?}",
             serialized_data
@@ -404,7 +76,8 @@ mod tests {
                 .collect::<Vec<String>>()
                 .join(" ")
         );
-        let deserialized_data = deserialize_u8_slice_from_utf8(serialized_data, schema_bit_counts);
+        let deserializer = Deserializer::new(schema);
+        let deserialized_data = deserializer.deserialize(serialized_data.as_bytes().to_vec());
 
         if let Err(message) = deserialized_data {
             println!("{message}");
@@ -446,23 +119,19 @@ mod tests {
             0b00110100, 0b00110001, 0b00110000, 0b00110000, 0b00110000,
         ];
 
-        let schema_data = [schema_id, username, user_id].concat();
+        let buffer = [schema_id, username, user_id].concat();
 
-        let serialized_data = serialize_u8_slice_to_utf8(
-            schema_data,
-            vec![
-                8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-            ],
-        )
-        .unwrap();
+        let serializer = Serializer::new(vec![
+            8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        ]);
+        let serialized_data = serializer.serialize(buffer).unwrap();
 
         println!("serialized_data: {}", serialized_data);
 
-        let deserialized_data = deserialize_u8_slice_from_utf8(
-            serialized_data,
-            [vec![8], [8].repeat(5), [8].repeat(19)].concat(),
-        )
-        .unwrap();
+        let deserializer = Deserializer::new([vec![8], [8].repeat(5), [8].repeat(19)].concat());
+        let deserialized_data = deserializer
+            .deserialize(serialized_data.as_bytes().to_vec())
+            .unwrap();
         let mut deserialized_data_iter = deserialized_data.iter();
 
         let schema_id = deserialized_data_iter.next().unwrap();
@@ -483,32 +152,39 @@ mod tests {
         println!("{user_id}");
     }
 
-    #[test]
-    fn serialize_n_deserialize_nullable() {
-        // Schema Id: 4 (1 bytes)
+    fn nullabe_cases(have_nullish_be_null: bool) {
+        // Schema Id: 4 (1 byte)
         let schema_id = vec![0b0000_0100];
         // "Yippee!" (7 bytes)
         let message = vec![
             0b01011001, 0b01101001, 0b01110000, 0b01110000, 0b01100101, 0b01100101, 0b00100001,
         ];
         println!("message: {message:?}");
-        // Nullable<500> (1 bit + 2 byte)
-        let extra_value = vec![0b00000001, 0b00000001, 0b11110100];
+        // Nullable<500> (1 bit + 2 bytes)
+        let extra_value = if have_nullish_be_null {
+            vec![0b000000000]
+        } else {
+            vec![0b000000001, 0b00000001, 0b11110100]
+        };
         println!("extra_value: {extra_value:?}");
+        // 69 (1 byte)
+        let final_value = vec![0b01000101];
 
-        let schema_data = [schema_id, message, extra_value].concat();
-        let schema_bit_counts = [
+        let buffer = [schema_id, message, extra_value, final_value].concat();
+        let schema = [
             // schema_id
             vec![8],
             // message
             vec![8].repeat(7),
             // extra_value
-            vec![0, 1, 8, 8],
+            vec![0, 2, 8, 8],
+            // final_value
+            vec![8],
         ]
         .concat();
 
-        let serialized_data =
-            serialize_u8_slice_to_utf8(schema_data, schema_bit_counts.clone()).unwrap();
+        let serializer = Serializer::new(schema.clone());
+        let serialized_data = serializer.serialize(buffer).unwrap();
 
         println!(
             "serialized_data: {:?}",
@@ -519,8 +195,10 @@ mod tests {
                 .collect::<Vec<String>>()
         );
 
-        let deserialized_data =
-            deserialize_u8_slice_from_utf8(serialized_data, schema_bit_counts).unwrap();
+        let deserializer = Deserializer::new(schema);
+        let deserialized_data = deserializer
+            .deserialize(serialized_data.as_bytes().to_vec())
+            .unwrap();
         let mut deserialized_data_iter = deserialized_data.iter();
 
         let schema_id = deserialized_data_iter.next().unwrap();
@@ -535,7 +213,12 @@ mod tests {
 
         let extra_value_is_null = *deserialized_data_iter.next().unwrap() == 0;
         let extra_value = extra_value_is_null
-            .then(|| "NULL".to_string())
+            .then(|| {
+                deserialized_data_iter.next().unwrap();
+                deserialized_data_iter.next().unwrap();
+
+                "NULL".to_string()
+            })
             .unwrap_or_else(|| {
                 format!(
                     "{}",
@@ -546,5 +229,18 @@ mod tests {
                 )
             });
         println!("{extra_value}");
+
+        let final_value = deserialized_data_iter.next().unwrap();
+        println!("{final_value}");
+    }
+
+    #[test]
+    fn serialize_n_deserialize_nullable_is_null() {
+        nullabe_cases(true);
+    }
+
+    #[test]
+    fn serialize_n_deserialize_nullable_is_not_null() {
+        nullabe_cases(false);
     }
 }
