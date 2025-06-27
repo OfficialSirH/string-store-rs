@@ -10,8 +10,8 @@ pub struct Serializer {
 }
 
 impl Serializer {
-    pub fn new(schema: Vec<usize>) -> Serializer {
-        Serializer { schema }
+    pub fn new(schema: Vec<usize>) -> Self {
+        Self { schema }
     }
 
     /// Assuming the max length bytes, 4, UTF-8 will allow:

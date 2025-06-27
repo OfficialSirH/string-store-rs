@@ -5,8 +5,8 @@ pub struct Deserializer {
 }
 
 impl Deserializer {
-    pub fn new(schema: Vec<usize>) -> Deserializer {
-        Deserializer { schema }
+    pub fn new(schema: Vec<usize>) -> Self {
+        Self { schema }
     }
 
     pub fn deserialize(&self, buffer: Vec<u8>) -> Result<Vec<u8>, &'static str> {
